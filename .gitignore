@@ -26,3 +26,5 @@ __pycache__/
 
 /.wrangler/
 **/.wrangler/
+herdr-windows-x86_64/
+herdr-windows-x86_64.zip
