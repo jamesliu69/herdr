@@ -12,6 +12,8 @@ categories = ["command-line-utilities"]
 include = [
     "src/**/*",
     "assets/sounds/*",
+    "assets/herdr.ico",
+    "assets/herdr.rc",
     "docs/next/api/herdr-api.schema.json",
     "skills/herdr/SKILL.md",
     "distribution/install.ps1",
@@ -93,3 +95,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.11"
