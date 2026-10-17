@@ -1,0 +1,5 @@
+commit=143bf5fd4781d164260c63fe28e7dc08054ad32f
+target=x86_64-pc-windows-msvc
+libghostty_vt_optimize=ReleaseFast
+libghostty_vt_simd=true
+sha256=fc178c49e3e33f41c0464b40e38b082ddb1f29370677c35e9168d8fdba834d58  herdr-windows-x86_64.zip
