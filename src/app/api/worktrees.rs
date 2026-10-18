@@ -1262,6 +1262,108 @@ mod tests {
     }
 
     #[test]
+    fn api_worktree_create_rejects_option_shaped_base() {
+        let repo = create_committed_repo("api-worktree-create-option-base-repo");
+        let worktree_root = unique_temp_path("api-worktree-create-option-base-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    workspace_id: Some(workspace_id),
+                    branch: Some("worktree/option-base".into()),
+                    base: Some("--orphan".into()),
+                    ..WorktreeCreateParams::default()
+                }),
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+        assert!(error.error.message.contains("base"), "{error:?}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.pending_api_worktree_creates.is_empty());
+        assert!(!worktree_root.exists());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn api_worktree_create_rejects_option_shaped_branch() {
+        let repo = create_committed_repo("api-worktree-create-option-branch-repo");
+        let worktree_root = unique_temp_path("api-worktree-create-option-branch-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    workspace_id: Some(workspace_id),
+                    branch: Some("--orphan".into()),
+                    base: Some("HEAD".into()),
+                    ..WorktreeCreateParams::default()
+                }),
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+        assert!(error.error.message.contains("branch"), "{error:?}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.pending_api_worktree_creates.is_empty());
+        assert!(!worktree_root.exists());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_accepts_named_base() {
+        let repo = create_committed_repo("api-worktree-create-named-base-repo");
+        let worktree_root = unique_temp_path("api-worktree-create-named-base-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    workspace_id: Some(workspace_id),
+                    branch: Some("worktree/named-base".into()),
+                    base: Some("HEAD".into()),
+                    ..WorktreeCreateParams::default()
+                }),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated { worktree, .. } = success.result else {
+            panic!("expected worktree_created response");
+        };
+        assert_eq!(worktree.branch.as_deref(), Some("worktree/named-base"));
+        assert!(Path::new(&worktree.path).join("README.md").exists());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let remove = crate::worktree::build_worktree_remove_command(
+            &repo,
+            Path::new(&worktree.path),
+            false,
+            false,
+        );
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
     fn invalid_worktree_open_from_cwd_does_not_create_parent_workspace() {
         let repo = create_committed_repo("api-worktree-open-invalid-cwd-repo");
         let mut app = test_app();

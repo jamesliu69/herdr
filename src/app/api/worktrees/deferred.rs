@@ -121,7 +121,15 @@ impl App {
             );
             return;
         }
+        if let Err(message) = crate::worktree::validate_git_ref_operand("branch", &branch) {
+            Self::send_api_response(respond_to, encode_error(id, "invalid_params", message));
+            return;
+        }
         let base = params.base.unwrap_or_else(|| "HEAD".into());
+        if let Err(message) = crate::worktree::validate_git_ref_operand("base", &base) {
+            Self::send_api_response(respond_to, encode_error(id, "invalid_params", message));
+            return;
+        }
         let source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
             Ok(source) => source,
             Err(err) => {
