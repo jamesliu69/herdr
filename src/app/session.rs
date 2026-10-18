@@ -125,6 +125,19 @@ impl App {
             self.session_save_deadline = None;
             return;
         }
+        if self.state.workspaces.is_empty() {
+            // A host shutdown or forced stop can kill every pane before the
+            // server saves. Persisting the now-empty layout would clear the
+            // last good session file, so keep the previously saved session.
+            tracing::info!(
+                event = "persist.save",
+                subsystem = "persist",
+                outcome = "skipped_empty_shutdown",
+                "keeping the last saved session because the in-memory layout is empty"
+            );
+            self.session_save_deadline = None;
+            return;
+        }
         self.save_session_now();
     }
 }

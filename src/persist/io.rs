@@ -16,6 +16,13 @@ fn session_history_path() -> PathBuf {
     crate::session::data_dir().join("session-history.json")
 }
 
+/// Sibling of `target` that holds the previous complete session file.
+fn backup_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".bak");
+    PathBuf::from(name)
+}
+
 // Follow symlinks manually so a write through a (possibly dangling) symlink
 // lands on the target. `fs::canonicalize` requires the target to exist, which
 // excludes the dangling-symlink case stow users hit on the very first save.
@@ -43,27 +50,79 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
-    save_json_to_path(path, snapshot)
+    save_json_to_path(path, snapshot, true)
 }
 
-fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+fn save_json_to_path<T: serde::Serialize>(
+    path: &Path,
+    snapshot: &T,
+    rotate_backup: bool,
+) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(snapshot)?;
+    write_json_durably(&target, json.as_bytes(), rotate_backup)
+}
+
+/// Publishes `contents` to `target` through a synced temp file and an atomic
+/// replacement. With `rotate_backup`, the previous complete file is copied to
+/// `<target>.bak` first so a failed replacement or later damage to the primary
+/// file still leaves the last complete session recoverable.
+fn write_json_durably(target: &Path, contents: &[u8], rotate_backup: bool) -> std::io::Result<()> {
     let tmp_path = target.with_extension("json.tmp");
-    let mut temporary = std::fs::File::create(&tmp_path)?;
-    // A rename can survive a hard crash before unflushed file contents reach disk.
-    let result = temporary
-        .write_all(json.as_bytes())
-        .and_then(|()| temporary.sync_all());
-    drop(temporary);
-    if let Err(err) = result.and_then(|()| crate::platform::replace_file(&tmp_path, &target)) {
+    let result = write_and_sync(&tmp_path, contents).and_then(|()| {
+        if rotate_backup {
+            if let Err(err) = rotate_backup_file(target) {
+                tracing::warn!(
+                    event = "persist.backup", subsystem = "persist", outcome = "error",
+                    path = %target.display(), err = %err,
+                    "failed to keep the previous session copy; saving without it"
+                );
+            }
+        }
+        crate::platform::replace_file(&tmp_path, target)
+    });
+    if let Err(err) = result {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
     crate::platform::sync_parent_directory(target.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn write_and_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut temporary = std::fs::File::create(path)?;
+    // A rename can survive a hard crash before unflushed file contents reach disk.
+    temporary.write_all(contents)?;
+    temporary.sync_all()
+}
+
+/// Keeps the current session file as `<target>.bak`. Only a file that still
+/// parses is kept, so a damaged primary cannot replace a good backup.
+fn rotate_backup_file(target: &Path) -> std::io::Result<()> {
+    let content = match std::fs::read(target) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let Ok(text) = std::str::from_utf8(&content) else {
+        return Ok(());
+    };
+    if parse_snapshot(text).is_err() {
+        return Ok(());
+    }
+    let backup = backup_path(target);
+    let mut pending_name = backup.clone().into_os_string();
+    pending_name.push(".pending");
+    let pending = PathBuf::from(pending_name);
+    let result = write_and_sync(&pending, &content)
+        .and_then(|()| crate::platform::replace_file(&pending, &backup));
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&pending);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub(super) fn save_history_to_path(
@@ -71,15 +130,26 @@ pub(super) fn save_history_to_path(
     history: Option<&SessionHistorySnapshot>,
 ) -> std::io::Result<()> {
     match history {
-        Some(history) => save_json_to_path(path, history),
+        // Pane history is optional and often large; the session layout alone is
+        // what needs a recovery copy.
+        Some(history) => save_json_to_path(path, history, false),
         None => clear_path(path),
     }
 }
 
 pub(super) fn clear_path(path: &Path) -> std::io::Result<()> {
+    let target = resolve_write_target(path).unwrap_or_else(|_| path.to_path_buf());
+    let removed = remove_file_if_exists(path)? | remove_file_if_exists(&backup_path(&target))?;
+    if removed {
+        crate::platform::sync_parent_directory(target.parent().unwrap_or_else(|| Path::new(".")))?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -92,15 +162,18 @@ pub fn clear_history() {
 }
 
 pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
-    let content = match std::fs::read_to_string(&path) {
+    load_from_path(&session_path())
+}
+
+fn load_from_path(path: &Path) -> Option<SessionSnapshot> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
                 event = "persist.restore", subsystem = "persist", outcome = "missing",
                 path = %path.display(), "session file is missing"
             );
-            return None;
+            return recover_from_backup(path, "missing");
         }
         Err(err) => {
             warn!(
@@ -120,12 +193,74 @@ pub fn load() -> Option<SessionSnapshot> {
                         path = %path.display(), file_version = version, supported = SNAPSHOT_VERSION,
                         "session file is from a newer herdr version, ignoring"
                     );
-                    return None;
+                    return recover_from_backup(path, "unsupported_version");
                 }
             }
             warn!(
                 event = "persist.restore", subsystem = "persist", outcome = "parse_error",
                 path = %path.display(), err = %err, "failed to parse session file, ignoring"
+            );
+            recover_from_backup(path, "parse_error")
+        }
+    }
+}
+
+/// Falls back to the previous complete session kept by `rotate_backup_file`
+/// when the primary file is missing or unusable, then repairs the primary path
+/// so later saves rotate the recovered layout instead of the damaged file.
+fn recover_from_backup(path: &Path, reason: &str) -> Option<SessionSnapshot> {
+    let target = resolve_write_target(path).ok()?;
+    let backup = backup_path(&target);
+    let content = match std::fs::read_to_string(&backup) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                event = "persist.restore", subsystem = "persist", outcome = "no_backup",
+                path = %path.display(), backup = %backup.display(), reason,
+                "no session backup available"
+            );
+            return None;
+        }
+        Err(err) => {
+            warn!(
+                event = "persist.restore", subsystem = "persist", outcome = "backup_read_error",
+                path = %backup.display(), err = %err, reason, "failed to read session backup"
+            );
+            return None;
+        }
+    };
+    match parse_snapshot(&content) {
+        Ok(snapshot) => {
+            warn!(
+                event = "persist.restore", subsystem = "persist", outcome = "recovered",
+                path = %path.display(), backup = %backup.display(), reason,
+                "session file was unusable; recovered the previous saved session"
+            );
+            match serde_json::to_string_pretty(&snapshot) {
+                Ok(json) => {
+                    if let Err(err) = write_json_durably(&target, json.as_bytes(), false) {
+                        warn!(
+                            event = "persist.restore", subsystem = "persist", outcome = "repair_error",
+                            path = %target.display(), err = %err,
+                            "failed to repair session file from backup"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        event = "persist.restore", subsystem = "persist", outcome = "repair_error",
+                        path = %target.display(), err = %err, reason,
+                        "failed to serialize recovered session"
+                    );
+                }
+            }
+            Some(snapshot)
+        }
+        Err(err) => {
+            warn!(
+                event = "persist.restore", subsystem = "persist", outcome = "backup_parse_error",
+                path = %backup.display(), err = %err, reason,
+                "failed to parse session backup"
             );
             None
         }
@@ -199,6 +334,18 @@ mod tests {
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         }
+    }
+
+    fn snapshot_with_selected(selected: usize) -> SessionSnapshot {
+        let mut snapshot = empty_snapshot();
+        snapshot.selected = selected;
+        snapshot
+    }
+
+    fn read_selected(path: &Path) -> usize {
+        parse_snapshot(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .selected
     }
 
     fn history_snapshot(secret: &str) -> SessionHistorySnapshot {
@@ -276,6 +423,119 @@ mod tests {
         let history = std::fs::read_to_string(&history_path).unwrap();
         assert!(history.contains("new history"));
         assert!(!history.contains("old history"));
+        std::fs::remove_dir_all(session_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn save_keeps_the_previous_complete_session_in_the_backup() {
+        let path = temp_session_path("rotate-backup");
+        let backup = backup_path(&path);
+
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        assert!(!backup.exists(), "first save has no previous session");
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+
+        assert_eq!(read_selected(&path), 2);
+        assert_eq!(read_selected(&backup), 1);
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            2
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_session_recovers_from_backup() {
+        let path = temp_session_path("missing-backup");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let recovered = load_from_path(&path).expect("backup should be restored");
+        assert_eq!(recovered.selected, 1);
+        assert_eq!(read_selected(&path), 1, "the primary file is repaired");
+        assert_eq!(read_selected(&backup_path(&path)), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_session_recovers_from_backup() {
+        let path = temp_session_path("corrupt-backup");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+        std::fs::write(&path, b"\0\0\0\0").unwrap();
+
+        let recovered = load_from_path(&path).expect("backup should be restored");
+        assert_eq!(recovered.selected, 1);
+        assert_eq!(read_selected(&path), 1, "the primary file is repaired");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_session_without_backup_starts_empty() {
+        let path = temp_session_path("corrupt-no-backup");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        assert!(load_from_path(&path).is_none());
+        assert!(!backup_path(&path).exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_primary_does_not_replace_a_good_backup() {
+        let path = temp_session_path("damaged-primary");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        save_to_path(&path, &snapshot_with_selected(3)).unwrap();
+
+        assert_eq!(read_selected(&path), 3);
+        assert_eq!(
+            read_selected(&backup_path(&path)),
+            1,
+            "the last complete session stays recoverable"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_temp_write_keeps_the_previous_session_and_backup() {
+        let path = temp_session_path("failed-temp");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        assert!(save_to_path(&path, &snapshot_with_selected(3)).is_err());
+
+        assert_eq!(read_selected(&path), 2);
+        assert_eq!(read_selected(&backup_path(&path)), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clear_removes_session_and_its_backup() {
+        let path = temp_session_path("clear-backup");
+        save_to_path(&path, &snapshot_with_selected(1)).unwrap();
+        save_to_path(&path, &snapshot_with_selected(2)).unwrap();
+
+        clear_path(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(!backup_path(&path).exists());
+        assert!(load_from_path(&path).is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_saves_do_not_rotate_a_backup() {
+        let (session_path, history_path) = temp_session_paths("history-no-backup");
+        save_history_to_path(&history_path, Some(&history_snapshot("first"))).unwrap();
+        save_history_to_path(&history_path, Some(&history_snapshot("second"))).unwrap();
+
+        assert!(!backup_path(&history_path).exists());
         std::fs::remove_dir_all(session_path.parent().unwrap()).unwrap();
     }
 
