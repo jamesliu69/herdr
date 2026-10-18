@@ -539,6 +539,18 @@ async fn run_client_loop(
     #[cfg(unix)]
     let stdin_tx = event_tx.clone();
 
+    // Windows turns Ctrl+C into a console control event whenever the console is
+    // in processed mode. Forward that event through the stdin channel pane
+    // input already uses instead of letting the termination handler exit the
+    // client. Installed after the termination handler so it runs first.
+    #[cfg(windows)]
+    if !crate::platform::install_console_ctrl_c_forwarder({
+        let ctrl_c_tx = stdin_tx.clone();
+        move || input::windows_vti::forward_console_ctrl_c(&ctrl_c_tx)
+    }) {
+        warn!("failed to install the Windows Ctrl+C pane forwarder");
+    }
+
     let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
 
     // Spawn the stdin reader thread.

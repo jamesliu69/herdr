@@ -105,6 +105,47 @@ fn push_platform_input_events(
     handoff.push(events);
 }
 
+/// Pane input for a Ctrl+C that Windows delivered as a console control event
+/// instead of as a key record. Matches the mapper's translation of a native
+/// Ctrl+C record so both paths reach the shell identically.
+#[cfg(any(windows, test))]
+pub(in crate::client) fn ctrl_c_client_input_events() -> [crate::protocol::ClientInputEvent; 2] {
+    use crate::protocol::{ClientInputEvent, ClientKeyCode, ClientKeyKind, ClientKeySource};
+
+    let key = |kind| ClientInputEvent::Key {
+        code: ClientKeyCode::Char('c'),
+        modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+        kind,
+        repeat_count: 1,
+        generated_text: None,
+        source: ClientKeySource::Synthesized,
+    };
+    [key(ClientKeyKind::Press), key(ClientKeyKind::Release)]
+}
+
+/// Routes a system-processed Ctrl+C into the client's stdin channel. The
+/// console handler thread must return promptly, so a briefly full channel is
+/// retried a few times before the event is dropped.
+#[cfg(windows)]
+pub(in crate::client) fn forward_console_ctrl_c(event_tx: &mpsc::Sender<ClientLoopEvent>) {
+    let mut pending = Some(ClientLoopEvent::StdinEvents(
+        ctrl_c_client_input_events().to_vec(),
+    ));
+    for _ in 0..10 {
+        let Some(event) = pending.take() else {
+            return;
+        };
+        match event_tx.try_send(event) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                pending = Some(event);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+}
+
 #[cfg(windows)]
 /// The console input buffer: standard input when it is the console, otherwise
 /// the attached console's `CONIN$` (stdin redirected, e.g. mintty).
@@ -2441,6 +2482,25 @@ mod tests {
                 generated_text: None,
                 source: crate::protocol::ClientKeySource::Synthesized,
             }]
+        );
+    }
+
+    #[test]
+    fn console_ctrl_c_event_uses_the_native_ctrl_c_pane_input() {
+        let forwarded = ctrl_c_client_input_events();
+        // A system-processed Ctrl+C must produce the same press as the key
+        // record a raw console reports for the same gesture.
+        assert_eq!(forwarded[0], translate([key_char('\u{3}')])[0]);
+        assert_eq!(
+            forwarded[1],
+            crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('c'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+                kind: crate::protocol::ClientKeyKind::Release,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }
         );
     }
 

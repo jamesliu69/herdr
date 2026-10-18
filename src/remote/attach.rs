@@ -96,6 +96,10 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         Arc::new(AtomicBool::new(false)),
     )?;
 
+    // The client forwards a system-processed Ctrl+C to the pane; the launcher
+    // must not tear the bridge down under it.
+    crate::platform::ignore_console_ctrl_c();
+
     run_client_process(
         &local_socket,
         &reattach_command,
@@ -3288,6 +3292,9 @@ fn bridge_child(
     mut command: Command,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    // The bridge outlives pane input: keyboard Ctrl+C belongs to the pane, not
+    // to the SSH transport. Closing the console still ends it.
+    crate::platform::detach_child_from_keyboard_ctrl_c(&mut command);
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
 
     let mut child =

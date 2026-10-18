@@ -1051,3 +1051,23 @@ fn committed_text_still_reaches_a_report_all_pane_as_text() {
     let after = state.handle_input_bytes("\u{3042}".as_bytes());
     assert_eq!(pane_text_commits(&after).concat(), "\u{3042}");
 }
+
+#[test]
+fn console_ctrl_c_event_reaches_the_focused_pane() {
+    use crate::protocol::{ClientKeyCode, ClientKeyKind};
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+
+    let events = crate::client::input::windows_vti::ctrl_c_client_input_events();
+    let outcome = state.handle_client_events(&events);
+
+    assert_eq!(
+        pane_key_events(&outcome),
+        [
+            (ClientKeyCode::Char('c'), ClientKeyKind::Press),
+            (ClientKeyCode::Char('c'), ClientKeyKind::Release),
+        ]
+    );
+}

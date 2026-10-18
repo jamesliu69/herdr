@@ -192,6 +192,16 @@ pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -
     None
 }
 
+/// Windows reports a system-processed Ctrl+C as a console control event; other
+/// platforms deliver it as terminal input.
+#[cfg(not(windows))]
+pub(crate) fn ignore_console_ctrl_c() {}
+
+/// Keyboard Ctrl+C and console process groups are a Windows console concept;
+/// elsewhere an attached client receives the byte from a raw terminal instead.
+#[cfg(not(windows))]
+pub(crate) fn detach_child_from_keyboard_ctrl_c(_command: &mut std::process::Command) {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
