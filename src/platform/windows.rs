@@ -248,6 +248,71 @@ pub(crate) fn windows_virtual_terminal_input_active() -> bool {
     (unsafe { GetConsoleMode(handle, &mut mode) } != 0) && mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
 }
 
+/// The callback a system-processed Ctrl+C is routed to. Installed once per
+/// process through [`install_console_ctrl_c_forwarder`].
+static CONSOLE_CTRL_C_FORWARDER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Whether a console control event is a typed Ctrl+C that belongs to the pane.
+///
+/// Windows reports Ctrl+C as `CTRL_C_EVENT` whenever the console input is in
+/// processed mode. The client cannot let its termination handler consume that
+/// event, or the TUI exits instead of the pane seeing `\x03`.
+pub(crate) fn console_ctrl_event_is_typed_ctrl_c(event_type: u32) -> bool {
+    use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+    event_type == CTRL_C_EVENT
+}
+
+unsafe extern "system" fn console_ctrl_c_forwarder(event_type: u32) -> windows_sys::core::BOOL {
+    if !console_ctrl_event_is_typed_ctrl_c(event_type) {
+        // Ctrl+Break, window close, logoff, and shutdown keep their normal
+        // handling so the existing graceful-shutdown path still runs.
+        return 0;
+    }
+    if let Some(forward) = CONSOLE_CTRL_C_FORWARDER.get() {
+        forward();
+    }
+    1
+}
+
+/// Routes a system-processed Ctrl+C into `forward` instead of the client's
+/// termination handler. Must be installed after any handler whose other console
+/// events must keep working: Windows calls the most recently added handler
+/// first.
+pub(crate) fn install_console_ctrl_c_forwarder(forward: impl Fn() + Send + Sync + 'static) -> bool {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    if CONSOLE_CTRL_C_FORWARDER.set(Box::new(forward)).is_err() {
+        // Another caller already installed the process-wide forwarder.
+        return true;
+    }
+    unsafe { SetConsoleCtrlHandler(Some(console_ctrl_c_forwarder), 1) != 0 }
+}
+
+unsafe extern "system" fn console_ctrl_c_ignore(event_type: u32) -> windows_sys::core::BOOL {
+    i32::from(console_ctrl_event_is_typed_ctrl_c(event_type))
+}
+
+/// Keeps a launcher process alive when the console reports a system-processed
+/// Ctrl+C. The attached client owns the pane-forwarding handler, so the
+/// launcher must not tear down the bridge underneath it.
+pub(crate) fn ignore_console_ctrl_c() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    if unsafe { SetConsoleCtrlHandler(Some(console_ctrl_c_ignore), 1) } == 0 {
+        tracing::warn!("failed to install the Windows Ctrl+C launcher handler");
+    }
+}
+
+/// Keeps a long-lived child process out of keyboard Ctrl+C delivery. The SSH
+/// stdio bridge must survive the client forwarding Ctrl+C to a pane; explicit
+/// `CTRL_BREAK_EVENT`s and console close still reach the child.
+pub(crate) fn detach_child_from_keyboard_ctrl_c(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     // STATUS_CONTROL_C_EXIT is reported without a Unix signal by portable-pty.
     if status.exit_code() == 0xC000013A {
@@ -5602,5 +5667,48 @@ mod tests {
                 "second event is key-up"
             );
         }
+    }
+
+    #[test]
+    fn only_typed_ctrl_c_console_events_belong_to_the_pane() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+
+        assert!(super::console_ctrl_event_is_typed_ctrl_c(CTRL_C_EVENT));
+        for event in [
+            CTRL_BREAK_EVENT,
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        ] {
+            assert!(
+                !super::console_ctrl_event_is_typed_ctrl_c(event),
+                "console event {event} must keep its termination handling"
+            );
+        }
+    }
+
+    #[test]
+    fn console_ctrl_c_forwarder_reaches_the_callback_for_ctrl_c_only() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let counter = hits.clone();
+        assert!(super::install_console_ctrl_c_forwarder(move || {
+            counter.fetch_add(1, AtomicOrdering::AcqRel);
+        }));
+
+        // SAFETY: the callback only touches the counter installed above.
+        assert_eq!(unsafe { super::console_ctrl_c_forwarder(CTRL_C_EVENT) }, 1);
+        assert_eq!(hits.load(AtomicOrdering::Acquire), 1);
+        // SAFETY: as above; Ctrl+Break must keep its normal handling.
+        assert_eq!(
+            unsafe { super::console_ctrl_c_forwarder(CTRL_BREAK_EVENT) },
+            0
+        );
+        assert_eq!(hits.load(AtomicOrdering::Acquire), 1);
     }
 }
