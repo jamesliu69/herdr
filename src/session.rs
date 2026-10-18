@@ -10,6 +10,9 @@ use crate::ipc::LocalStream;
 pub const SESSION_ENV_VAR: &str = "HERDR_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
+/// Directory under the config dir that holds socket-override instance state.
+const INSTANCES_DIR_NAME: &str = "instances";
+
 const MAX_SESSION_NAME_LEN: usize = 64;
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_WAIT_POLL: Duration = Duration::from_millis(25);
@@ -166,6 +169,51 @@ pub fn data_dir_for(name: Option<&str>) -> PathBuf {
         Some(name) => config_dir.join("sessions").join(name),
         None => config_dir,
     }
+}
+
+/// Directory that holds this server instance's persisted session state.
+///
+/// Default and named sessions keep their documented directories. A server
+/// started with `HERDR_SOCKET_PATH` is neither: keying it by session name
+/// alone would let two live servers read and write one `session.json`, and
+/// the last save would silently replace the other server's workspaces
+/// (#5217). Each effective socket path therefore gets its own directory.
+///
+/// A named session keeps its own directory because a socket override only
+/// relocates where that session listens.
+pub fn persistence_dir() -> PathBuf {
+    if explicit_session_requested() || active_name().is_some() {
+        return data_dir();
+    }
+    let Some(socket_path) = socket_path_override() else {
+        return data_dir();
+    };
+    // Repeating the default session's own socket path is the same instance,
+    // not a second one. Child processes inherit `HERDR_SOCKET_PATH` this way.
+    if socket_path == api_socket_path_for(None) {
+        return data_dir();
+    }
+    crate::config::config_dir()
+        .join(INSTANCES_DIR_NAME)
+        .join(socket_instance_name(&socket_path))
+}
+
+fn socket_path_override() -> Option<PathBuf> {
+    std::env::var(crate::api::SOCKET_PATH_ENV_VAR)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn socket_instance_name(socket_path: &Path) -> String {
+    // Hash the path so the directory name stays short and portable, matching
+    // how per-socket client state is keyed elsewhere.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in socket_path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("socket-{hash:016x}")
 }
 
 pub fn api_socket_path_for(name: Option<&str>) -> PathBuf {
@@ -1038,6 +1086,95 @@ mod tests {
         std::env::remove_var(SESSION_ENV_VAR);
         clear_explicit_session_for_test();
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    #[test]
+    fn persistence_dir_separates_socket_override_instances() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-persistence-dir-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+
+        assert_eq!(persistence_dir(), data_dir());
+
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-a.sock");
+        let first = persistence_dir();
+        assert_eq!(first, persistence_dir());
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-b.sock");
+        let second = persistence_dir();
+
+        assert_ne!(first, second);
+        assert_ne!(first, data_dir());
+        assert!(first.starts_with(
+            config_home
+                .join(crate::config::app_dir_name())
+                .join("instances")
+        ));
+
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn persistence_dir_keeps_session_dir_for_matching_socket_override() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-persistence-match-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            api_socket_path_for(None).display().to_string(),
+        );
+
+        assert_eq!(persistence_dir(), data_dir());
+
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn named_session_keeps_its_dir_under_socket_override() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-persistence-named-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var(SESSION_ENV_VAR, "work");
+        clear_explicit_session_for_test();
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-named.sock");
+
+        assert_eq!(persistence_dir(), data_dir_for(Some("work")));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn explicit_session_ignores_socket_override_for_persistence_dir() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-persistence-explicit-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var(SESSION_ENV_VAR, "work");
+        EXPLICIT_SESSION_REQUESTED.store(true, Ordering::Relaxed);
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/ignored.sock");
+
+        assert_eq!(persistence_dir(), data_dir_for(Some("work")));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]

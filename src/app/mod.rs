@@ -3215,7 +3215,9 @@ mod tests {
         assert!(app.session_save_thread.is_some());
         assert!(app.session_save_deadline.is_none());
         app.save_session_now();
-        assert!(crate::session::data_dir().join("session.json").exists());
+        assert!(crate::session::persistence_dir()
+            .join("session.json")
+            .exists());
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(config_home);

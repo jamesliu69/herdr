@@ -59,6 +59,13 @@ impl SessionWriter {
     }
 
     pub(crate) fn clear(&mut self) {
+        // Leave the instance directory behind even when there is nothing to
+        // remove. Its existence records that this instance deliberately has no
+        // session, so the pre-upgrade fallback does not restore another
+        // session's state on the next start.
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::clear_path(&self.path)
@@ -534,6 +541,31 @@ mod tests {
         assert_eq!(std::fs::read(manual).unwrap(), b"manual recovery copy");
         assert_eq!(std::fs::read_dir(directory).unwrap().count(), 4);
         std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clear_creates_the_session_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-session-clear-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer = SessionWriter {
+            path: directory.join("session.json"),
+            protect_unloaded: false,
+        };
+
+        writer.clear();
+
+        assert!(
+            directory.exists(),
+            "clearing must leave the instance directory behind"
+        );
+        assert!(!writer.path.exists());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

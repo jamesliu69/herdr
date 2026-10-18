@@ -1,6 +1,8 @@
 //! Session persistence — save/restore workspaces, layouts, and working directories.
 //!
-//! Stored at `~/.config/herdr/session.json`.
+//! Stored at `~/.config/herdr/session.json` for the default session, in a named
+//! session directory for named sessions, and in a per-instance directory when
+//! `HERDR_SOCKET_PATH` names a separate server instance.
 //! Optional pane screen history is stored separately at `session-history.json`.
 //! Installed plugins are persisted separately at `plugins.json`.
 
