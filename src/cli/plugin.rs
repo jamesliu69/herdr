@@ -643,7 +643,7 @@ fn git_checkout(
         Some(reference) => {
             run_git(
                 Some(checkout),
-                ["fetch", "--depth", "1", "origin", reference],
+                ["fetch", "--depth", "1", "origin", "--", reference],
             )?;
         }
         None => {

@@ -183,6 +183,8 @@ pub(crate) fn build_worktree_remove_command(
     if force {
         args.push("--force".to_string());
     }
+    // End option parsing so a checkout path can never be read as a git flag.
+    args.push("--".to_string());
     args.push(path.display().to_string());
 
     WorktreeCommand {
@@ -236,6 +238,41 @@ pub(crate) fn checkout_has_dirty_files(
     }
 }
 
+/// Refuse operand values that git could consume as options or filesystem
+/// paths instead of the ref or commit-ish herdr intends. The API reports the
+/// message as `invalid_params` before any git process is spawned. The command
+/// builders also separate operands with `--` as defense in depth.
+pub(crate) fn validate_git_ref_operand(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if value.starts_with('-') {
+        return Err(format!("{label} {value:?} must not start with '-'"));
+    }
+    if value.contains("--") {
+        return Err(format!("{label} {value:?} must not contain '--'"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(format!(
+            "{label} {value:?} must not contain whitespace or control characters"
+        ));
+    }
+    // Ref components may contain single slashes (`worktree/brave-river`), but a
+    // path-shaped value must never reach git as a ref or commit-ish.
+    if value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|component| component == "." || component == "..")
+    {
+        return Err(format!("{label} {value:?} must not be a filesystem path"));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_worktree_add_new_branch_command(
     repo_root: &Path,
     path: &Path,
@@ -249,6 +286,8 @@ pub(crate) fn build_worktree_add_new_branch_command(
         "add".to_string(),
         "-b".to_string(),
         branch.to_string(),
+        // End option parsing so path and base can never be read as git flags.
+        "--".to_string(),
         path.display().to_string(),
         base.to_string(),
     ]);
@@ -268,6 +307,8 @@ pub(crate) fn build_worktree_add_existing_branch_command(
     args.extend([
         "worktree".to_string(),
         "add".to_string(),
+        // End option parsing so path and branch can never be read as git flags.
+        "--".to_string(),
         path.display().to_string(),
         branch.to_string(),
     ]);
@@ -834,6 +875,7 @@ prunable stale
                 "/repo/herdr",
                 "worktree",
                 "remove",
+                "--",
                 "/w/herdr/issue-137"
             ]
         );
@@ -855,6 +897,7 @@ prunable stale
                 "worktree",
                 "remove",
                 "--force",
+                "--",
                 "/w/herdr/issue-137"
             ]
         );
@@ -958,6 +1001,7 @@ prunable stale
                 "add",
                 "-b",
                 "worktree/brave-river",
+                "--",
                 "/w/herdr/worktree-brave-river",
                 "HEAD"
             ]
@@ -980,10 +1024,77 @@ prunable stale
                 "/repo/herdr",
                 "worktree",
                 "add",
+                "--",
                 "/w/herdr/worktree-brave-river",
                 "worktree/brave-river"
             ]
         );
+    }
+
+    #[test]
+    fn git_ref_operand_validation_rejects_option_and_path_shapes() {
+        for value in [
+            "--orphan",
+            "--",
+            "-b",
+            "feature--x",
+            " HEAD",
+            "HEAD ",
+            "/tmp/base",
+            "base/../other",
+            r"C:\repos\base",
+            ".",
+            "..",
+            "a/..",
+        ] {
+            assert!(
+                validate_git_ref_operand("base", value).is_err(),
+                "expected {value:?} to be rejected"
+            );
+        }
+        for value in ["", "   "] {
+            assert!(validate_git_ref_operand("branch", value).is_err());
+        }
+    }
+
+    #[test]
+    fn git_ref_operand_validation_accepts_normal_refs() {
+        for value in [
+            "HEAD",
+            "HEAD~2",
+            "HEAD^",
+            "main",
+            "origin/main",
+            "refs/heads/main",
+            "v1.2.3",
+            "feature/new-thing",
+            "worktree/brave-river-0000",
+        ] {
+            assert_eq!(
+                validate_git_ref_operand("base", value),
+                Ok(()),
+                "expected {value:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_add_separator_stops_option_shaped_base_from_creating_orphan() {
+        let repo = create_committed_repo("worktree-base-separator-repo");
+        let checkout = unique_temp_path("worktree-base-separator-checkout");
+        let command = build_worktree_add_new_branch_command(
+            &repo,
+            &checkout,
+            "worktree/base-separator",
+            "--orphan",
+            false,
+        );
+
+        let error = run_worktree_command(&command).unwrap_err();
+
+        assert!(error.contains("invalid reference"), "{error}");
+        assert!(!checkout.exists());
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]
