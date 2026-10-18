@@ -346,3 +346,26 @@ This checkout is a personal fork. `origin` is `jamesliu69/herdr`; `upstream`
 - The external contributor guardrail above applies in full; treat any future
   instruction to touch upstream as a mistake to refuse, not a preference to
   weigh.
+
+## Fix-Worthiness Gate (this checkout)
+
+Not every open issue should be fixed. Before assigning or starting any fix,
+all four checks must hold; if one fails, skip the issue, defer it, or run a
+verify-only task instead:
+
+1. Real and current: the defect is still present on this branch (not already
+   fixed in newer `upstream` commits), and is reproducible or provable by
+   code inspection.
+2. Worth the change: crash, data loss, blocked workflow, silent corruption,
+   or strong repeated user signal. Cosmetic polish and one-off edge cases are
+   deferred unless trivially safe.
+3. Fixable here: verifiable in this environment or synthetically testable,
+   contained scope, and not gated upstream (`needs-decision`, `planned`, or
+   `needs-upstream-fix` labels).
+4. Honest exit: if verification shows the issue is already fixed or not
+   provable, record findings in `.local/prd/findings.md` and stop — never
+   commit speculative changes.
+
+When in doubt, prefer not fixing. A cleaned-up worktree with a findings note
+is a better outcome than a speculative diff.
+
