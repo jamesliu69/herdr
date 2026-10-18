@@ -319,6 +319,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    let path = crate::config::config_path();
     let diagnostics = crate::config::Config::load().diagnostics;
     if diagnostics.is_empty() {
         println!("config: ok");
@@ -327,6 +328,14 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
         for diagnostic in &diagnostics {
             println!("{diagnostic}");
         }
+    }
+    if path.is_file() {
+        println!("config path: {}", path.display());
+    } else {
+        println!(
+            "config path: {} (no file; using built-in defaults)",
+            path.display()
+        );
     }
 
     Ok(i32::from(!diagnostics.is_empty()))
