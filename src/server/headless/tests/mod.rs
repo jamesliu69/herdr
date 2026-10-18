@@ -8283,6 +8283,70 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
 /// Verify that calls to the app's internal-event methods only occur inside
 /// `handle_internal_event_with_forwarding`. This ensures the forwarding
 /// bypass cannot be reintroduced.
+#[tokio::test]
+async fn workspace_create_fails_fast_when_the_pty_spawn_blocks_on_its_cwd() {
+    use api::schema::{Method, WorkspaceCreateParams};
+
+    let mut server = test_headless_server();
+    let cwd = std::env::temp_dir().join(format!(
+        "herdr-5361-blocked-cwd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&cwd).expect("create blocked cwd");
+    let workspaces_before = server.app.state.workspaces.len();
+
+    crate::pty::backend::test_hook::set_spawn_timeout_for_cwd(&cwd, Duration::from_millis(50));
+    let release = crate::pty::backend::test_hook::block_next_spawn_for_cwd(&cwd);
+    let watchdog_release = release.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(5));
+        let _ = watchdog_release.send(());
+    });
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "blocked-workspace-create".into(),
+            method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                source_workspace_id: None,
+                cwd: Some(cwd.display().to_string()),
+                focus: false,
+                label: None,
+                env: Default::default(),
+            }),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let elapsed = started.elapsed();
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("workspace create must answer while the spawn is blocked");
+    crate::pty::backend::test_hook::clear_spawn_timeout();
+    let _ = release.send(());
+
+    let error: api::schema::ErrorResponse =
+        serde_json::from_str(&response).expect("workspace create error response");
+    assert_eq!(error.error.code, "workspace_create_failed");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "workspace create must not wait for the blocked spawn: {elapsed:?}"
+    );
+    assert_eq!(
+        server.app.state.workspaces.len(),
+        workspaces_before,
+        "a timed-out create must not add a workspace"
+    );
+
+    shutdown_test_runtimes(&mut server);
+    let _ = fs::remove_dir_all(&cwd);
+}
+
 #[test]
 fn no_handle_internal_event_bypass_in_module() {
     let source = include_str!("../../headless.rs");

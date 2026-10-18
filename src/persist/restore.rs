@@ -520,7 +520,9 @@ fn restore_tab(
 
         let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
-        if !has_import && !cwd.is_dir() {
+        // Probe the directory off-thread so a frozen mount cannot stall
+        // startup indefinitely; a timeout counts as unavailable.
+        if !has_import && !crate::pty::backend::directory_is_available(&cwd).unwrap_or(false) {
             let terminal = unavailable_restored_terminal(
                 saved_pane,
                 cwd,

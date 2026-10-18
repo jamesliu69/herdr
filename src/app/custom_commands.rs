@@ -275,7 +275,7 @@ impl App {
                             "HERDR_ACTIVE_PANE_CWD".to_string(),
                             pane_cwd.display().to_string(),
                         ));
-                        if pane_cwd.is_dir() {
+                        if crate::pty::backend::directory_is_available(&pane_cwd).unwrap_or(false) {
                             cwd = Some(pane_cwd);
                         }
                     }
