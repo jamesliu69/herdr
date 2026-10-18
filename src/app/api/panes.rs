@@ -497,7 +497,7 @@ impl App {
         };
 
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
-        self.state.mark_active_tab_seen();
+        self.mark_active_tab_seen();
         self.state.mode = crate::app::Mode::Terminal;
 
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
@@ -4343,6 +4343,20 @@ mod tests {
             panic!("expected pane info response");
         };
         assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+
+        // The seen flip must reach status subscribers without a focus event.
+        let events = app.event_hub.events_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].1.event,
+            crate::api::schema::EventKind::PaneAgentStatusChanged
+        );
+        let crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. } =
+            &events[0].1.data
+        else {
+            panic!("expected pane agent status event");
+        };
+        assert_eq!(*agent_status, crate::api::schema::AgentStatus::Idle);
     }
 
     #[test]
