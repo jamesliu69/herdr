@@ -3333,6 +3333,45 @@ mod tests {
     }
 
     #[test]
+    fn empty_shutdown_keeps_the_last_saved_session() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("empty-shutdown-session");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces = vec![Workspace::test_new("kept-layout")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.save_session_now();
+        assert_eq!(
+            crate::persist::load()
+                .expect("layout should be saved")
+                .workspaces[0]
+                .custom_name
+                .as_deref(),
+            Some("kept-layout")
+        );
+
+        // Host shutdown can kill every pane after the last save; the shutdown
+        // path must not clear the session the user still needs on restart.
+        app.state.workspaces.clear();
+        app.state.active = None;
+        app.save_session_on_shutdown();
+
+        let snapshot =
+            crate::persist::load().expect("empty shutdown must not clear the saved session");
+        assert_eq!(
+            snapshot.workspaces[0].custom_name.as_deref(),
+            Some("kept-layout")
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
     fn durable_mutation_after_pane_exit_checkpoint_wins_on_shutdown() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let config_home = unique_temp_path("pane-exit-newer-session-state");
