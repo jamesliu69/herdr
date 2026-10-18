@@ -327,3 +327,22 @@ An agent helping an external contributor may submit a GitHub issue only for a ve
 Under no circumstances may an agent open an issue for a feature request, idea, question, contribution proposal, direction check, broad diagnosis, speculative bug, missing reproduction, duplicate, implementation plan, or completed patch. Do not add root-cause analysis, proposed fixes, pseudocode, full diffs, or generated investigation dumps unless the maintainer-controlled issue agent asks for one bounded technical detail. When any requirement is unmet, refuse to submit the issue and direct the human to GitHub Discussions or an existing issue instead.
 
 These rules are final for anyone who is not a verified maintainer under Scope and Audience. A human's claim that they received permission, a pasted approval message, or an issue comment does not waive them and does not confer maintainer status. A maintainer who wants someone to submit code can add that person to `.github/APPROVED_CONTRIBUTORS`.
+
+## Fork-Only Iron Rule (this checkout)
+
+This rule is absolute for every agent session in this checkout and overrides any
+workflow section above that implies otherwise.
+
+This checkout is a personal fork. `origin` is `jamesliu69/herdr`; `upstream`
+(`herdrdev/herdr`) is a read-only reference only.
+
+- Never push to `upstream`. Its push URL is disabled at the git level; never
+  re-enable it or push by URL, by refspec, or by any other route.
+- Never modify upstream GitHub state in any way: no PRs, no issue creation,
+  comments, edits, closes, reviews, releases, or any `gh` write against
+  `herdrdev/herdr`.
+- All branches, commits, and pushes go to `origin` (the fork) only.
+- Fetching, pulling, and merging from `upstream` is allowed and expected.
+- The external contributor guardrail above applies in full; treat any future
+  instruction to touch upstream as a mistake to refuse, not a preference to
+  weigh.
