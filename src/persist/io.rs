@@ -9,11 +9,41 @@ use super::snapshot::{
 };
 
 pub(super) fn session_path() -> PathBuf {
-    crate::session::data_dir().join("session.json")
+    crate::session::persistence_dir().join("session.json")
 }
 
 fn session_history_path() -> PathBuf {
-    crate::session::data_dir().join("session-history.json")
+    crate::session::persistence_dir().join("session-history.json")
+}
+
+/// Pre-upgrade location of this instance's session file.
+///
+/// A server started with `HERDR_SOCKET_PATH` used to keep its state in the
+/// session data directory. That directory still holds the default session's
+/// state, so it is only read as a migration fallback and never written.
+fn legacy_session_path() -> Option<PathBuf> {
+    if !instance_has_no_state() {
+        return None;
+    }
+    let path = crate::session::data_dir().join("session.json");
+    (path != session_path()).then_some(path)
+}
+
+fn legacy_session_history_path() -> Option<PathBuf> {
+    if !instance_has_no_state() {
+        return None;
+    }
+    let path = crate::session::data_dir().join("session-history.json");
+    (path != session_history_path()).then_some(path)
+}
+
+/// True while this instance has never written its own session state.
+///
+/// A missing `session.json` alone is not enough: clearing the last workspace
+/// deliberately removes it, and that must not resurrect the shared pre-upgrade
+/// file. The instance directory exists as soon as the writer saves or clears.
+fn instance_has_no_state() -> bool {
+    !crate::session::persistence_dir().exists()
 }
 
 // Follow symlinks manually so a write through a (possibly dangling) symlink
@@ -91,27 +121,26 @@ pub fn clear_history() {
     }
 }
 
-pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
-    let content = match std::fs::read_to_string(&path) {
+enum SnapshotRead {
+    Missing,
+    Found(SessionSnapshot),
+    Failed,
+}
+
+fn read_snapshot(path: &Path) -> SnapshotRead {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
-                event = "persist.restore", subsystem = "persist", outcome = "missing",
-                path = %path.display(), "session file is missing"
-            );
-            return None;
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return SnapshotRead::Missing,
         Err(err) => {
             warn!(
                 event = "persist.restore", subsystem = "persist", outcome = "read_error",
                 path = %path.display(), err = %err, "failed to read session file"
             );
-            return None;
+            return SnapshotRead::Failed;
         }
     };
     match parse_snapshot(&content) {
-        Ok(snapshot) => Some(snapshot),
+        Ok(snapshot) => SnapshotRead::Found(snapshot),
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
                 if version > SNAPSHOT_VERSION {
@@ -120,25 +149,50 @@ pub fn load() -> Option<SessionSnapshot> {
                         path = %path.display(), file_version = version, supported = SNAPSHOT_VERSION,
                         "session file is from a newer herdr version, ignoring"
                     );
-                    return None;
+                    return SnapshotRead::Failed;
                 }
             }
             warn!(
                 event = "persist.restore", subsystem = "persist", outcome = "parse_error",
                 path = %path.display(), err = %err, "failed to parse session file, ignoring"
             );
-            None
+            SnapshotRead::Failed
         }
     }
 }
 
-pub fn load_history() -> Option<SessionHistorySnapshot> {
-    let path = session_history_path();
-    if !path.exists() {
-        return None;
+pub fn load() -> Option<SessionSnapshot> {
+    let path = session_path();
+    match read_snapshot(&path) {
+        SnapshotRead::Found(snapshot) => Some(snapshot),
+        // An instance file that exists but cannot be read is authoritative:
+        // never resurrect another session's state over it.
+        SnapshotRead::Failed => None,
+        SnapshotRead::Missing => {
+            tracing::info!(
+                event = "persist.restore", subsystem = "persist", outcome = "missing",
+                path = %path.display(), "session file is missing"
+            );
+            let legacy = legacy_session_path()?;
+            match read_snapshot(&legacy) {
+                SnapshotRead::Found(snapshot) => {
+                    warn!(
+                        event = "persist.restore", subsystem = "persist", outcome = "legacy_fallback",
+                        path = %legacy.display(), session_path = %path.display(),
+                        "no per-instance session file yet; restored the shared pre-upgrade session file. Future saves use the per-instance path."
+                    );
+                    Some(snapshot)
+                }
+                SnapshotRead::Missing | SnapshotRead::Failed => None,
+            }
+        }
     }
-    let content = match std::fs::read_to_string(&path) {
+}
+
+fn read_history(path: &Path) -> Option<SessionHistorySnapshot> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
             warn!(err = %err, "failed to read session history file");
             return None;
@@ -161,6 +215,15 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
             None
         }
     }
+}
+
+pub fn load_history() -> Option<SessionHistorySnapshot> {
+    if let Some(history) = read_history(&session_history_path()) {
+        return Some(history);
+    }
+    // Adopt the pre-upgrade history only together with the pre-upgrade session
+    // snapshot, never for an instance that has its own state.
+    legacy_session_history_path().and_then(|path| read_history(&path))
 }
 
 #[cfg(test)]
@@ -217,6 +280,153 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn with_isolated_config<R>(name: &str, run: impl FnOnce() -> R) -> R {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-session-io-{name}-{}", std::process::id()));
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR);
+        let previous_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+
+        let result = run();
+
+        restore_env("XDG_CONFIG_HOME", previous_config_home);
+        restore_env(crate::api::SOCKET_PATH_ENV_VAR, previous_socket);
+        restore_env(crate::session::SESSION_ENV_VAR, previous_session);
+        crate::session::clear_explicit_session_for_test();
+        let _ = std::fs::remove_dir_all(&config_home);
+        result
+    }
+
+    #[test]
+    fn socket_overrides_do_not_share_one_session_file() {
+        with_isolated_config("socket-instances", || {
+            std::env::set_var(
+                crate::api::SOCKET_PATH_ENV_VAR,
+                "/tmp/herdr-instance-a.sock",
+            );
+            let path_a = session_path();
+            let mut snapshot_a = empty_snapshot();
+            snapshot_a.selected = 1;
+            save_to_path(&path_a, &snapshot_a).unwrap();
+
+            std::env::set_var(
+                crate::api::SOCKET_PATH_ENV_VAR,
+                "/tmp/herdr-instance-b.sock",
+            );
+            let path_b = session_path();
+            let mut snapshot_b = empty_snapshot();
+            snapshot_b.selected = 2;
+            save_to_path(&path_b, &snapshot_b).unwrap();
+
+            assert_ne!(path_a, path_b);
+            assert_eq!(load().unwrap().selected, 2);
+            assert!(session_path().parent().unwrap().exists());
+            assert!(!crate::session::data_dir().join("session.json").exists());
+
+            std::env::set_var(
+                crate::api::SOCKET_PATH_ENV_VAR,
+                "/tmp/herdr-instance-a.sock",
+            );
+            assert_eq!(load().unwrap().selected, 1);
+        });
+    }
+
+    #[test]
+    fn load_falls_back_to_pre_upgrade_session_and_never_rewrites_it() {
+        with_isolated_config("legacy-fallback", || {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-legacy.sock");
+            let legacy_path = crate::session::data_dir().join("session.json");
+            let instance_path = session_path();
+            assert_ne!(legacy_path, instance_path);
+
+            let mut legacy = empty_snapshot();
+            legacy.selected = 7;
+            save_to_path(&legacy_path, &legacy).unwrap();
+
+            let restored = load().expect("pre-upgrade session should be restored");
+            assert_eq!(restored.selected, 7);
+            assert!(
+                !instance_path.exists(),
+                "reading the fallback must not write the instance file"
+            );
+
+            let legacy_bytes = std::fs::read(&legacy_path).unwrap();
+            let mut instance = empty_snapshot();
+            instance.selected = 3;
+            save_to_path(&instance_path, &instance).unwrap();
+            assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+
+            let mut newer_legacy = empty_snapshot();
+            newer_legacy.selected = 9;
+            save_to_path(&legacy_path, &newer_legacy).unwrap();
+            assert_eq!(
+                load().unwrap().selected,
+                3,
+                "the instance file must win once it exists"
+            );
+
+            // Clearing the last workspace removes the file but keeps the
+            // instance directory; that must not resurrect the legacy session.
+            clear_path(&instance_path).unwrap();
+            assert!(
+                load().is_none(),
+                "an intentionally cleared instance must stay cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn broken_instance_file_does_not_fall_back_to_another_session() {
+        with_isolated_config("broken-instance", || {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-broken.sock");
+            let mut legacy = empty_snapshot();
+            legacy.selected = 7;
+            save_to_path(&crate::session::data_dir().join("session.json"), &legacy).unwrap();
+
+            let instance_path = session_path();
+            std::fs::create_dir_all(instance_path.parent().unwrap()).unwrap();
+            std::fs::write(&instance_path, "{ not json").unwrap();
+
+            assert!(load().is_none());
+        });
+    }
+
+    #[test]
+    fn load_history_falls_back_only_with_the_pre_upgrade_snapshot() {
+        with_isolated_config("history-fallback", || {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/herdr-history.sock");
+            let legacy_session = crate::session::data_dir().join("session.json");
+            let legacy_history = crate::session::data_dir().join("session-history.json");
+            save_to_path(&legacy_session, &empty_snapshot()).unwrap();
+            save_history_to_path(&legacy_history, Some(&history_snapshot("legacy-secret")))
+                .unwrap();
+
+            let history = load_history().expect("pre-upgrade history should be restored");
+            assert_eq!(
+                history.workspaces[0].tabs[0].panes[&0].ansi,
+                "legacy-secret"
+            );
+
+            save_to_path(&session_path(), &empty_snapshot()).unwrap();
+            assert!(
+                load_history().is_none(),
+                "another session's history must not leak in"
+            );
+        });
     }
 
     #[test]
