@@ -1587,6 +1587,15 @@ mod tests {
                 };
                 pane_get_count += 1;
                 let response = if pane_get_count == 1 {
+                    // A closed pane publishes the event that wakes the
+                    // subscription before the next resample fails.
+                    responder_event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneClosed,
+                        data: crate::api::schema::EventData::PaneClosed {
+                            pane_id: "pane_1".into(),
+                            workspace_id: "ws_1".into(),
+                        },
+                    });
                     serde_json::to_string(&SuccessResponse {
                         id: msg.request.id,
                         result: ResponseResult::PaneInfo {
@@ -1595,15 +1604,6 @@ mod tests {
                     })
                     .unwrap()
                 } else {
-                    if pane_get_count == 2 {
-                        responder_event_hub.push(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::PaneClosed,
-                            data: crate::api::schema::EventData::PaneClosed {
-                                pane_id: "pane_1".into(),
-                                workspace_id: "ws_1".into(),
-                            },
-                        });
-                    }
                     error_response_json(
                         msg.request.id,
                         "pane_not_found",

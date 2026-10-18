@@ -53,6 +53,7 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_status: Option<crate::api::schema::AgentStatus>,
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
+    last_snapshot_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
 }
@@ -230,6 +231,7 @@ impl ActiveSubscription {
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
                         last_sequence,
+                        last_snapshot_sequence: last_sequence,
                         initial_event,
                         request_prefix: format!("{request_id}:sub:{index}"),
                     },
@@ -480,6 +482,11 @@ impl ActiveAgentStatusChangedSubscription {
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(event),
             }));
+        } else if event_hub.current_sequence() == self.last_snapshot_sequence {
+            // Nothing has been published since the last observed snapshot, so
+            // the pane's subscriber-visible state cannot have changed. Skipping
+            // the read keeps idle subscriptions from resampling every tick.
+            return Ok(None);
         }
 
         let before_snapshot_sequence = self.last_sequence;
@@ -495,6 +502,7 @@ impl ActiveAgentStatusChangedSubscription {
         let pane = pane?;
 
         let event = self.event_from_snapshot(pane);
+        self.last_snapshot_sequence = after_snapshot_sequence;
         if event.is_some() {
             self.last_sequence = after_snapshot_sequence;
         }
@@ -717,6 +725,13 @@ mod tests {
         }
     }
 
+    fn pane_info_with_status(agent_status: AgentStatus) -> PaneInfo {
+        PaneInfo {
+            agent_status,
+            ..pane_info_with_scroll(None)
+        }
+    }
+
     #[test]
     fn lifecycle_subscription_skips_history_but_keeps_setup_window_events() {
         let event_hub = EventHub::default();
@@ -812,6 +827,7 @@ mod tests {
                     last_status: Some(AgentStatus::Working),
                     last_presentation: None,
                     last_sequence: event_hub.current_sequence(),
+                    last_snapshot_sequence: event_hub.current_sequence(),
                     initial_event: Some(PaneAgentStatusChangedEvent {
                         pane_id: "pane_1".into(),
                         workspace_id: "workspace_1".into(),
@@ -906,6 +922,7 @@ mod tests {
                 state_labels: HashMap::new(),
             }),
             last_sequence: event_hub.current_sequence(),
+            last_snapshot_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
         };
@@ -943,6 +960,7 @@ mod tests {
                 state_labels: HashMap::new(),
             }),
             last_sequence: event_hub.current_sequence(),
+            last_snapshot_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
@@ -988,6 +1006,7 @@ mod tests {
                 state_labels: HashMap::new(),
             }),
             last_sequence: event_hub.current_sequence(),
+            last_snapshot_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
@@ -1010,5 +1029,89 @@ mod tests {
         };
         assert_eq!(data.title.as_deref(), Some("short lived"));
         assert!(subscription.initial_event.is_none());
+    }
+
+    #[test]
+    fn idle_agent_status_subscription_resamples_only_after_hub_activity() {
+        let event_hub = EventHub::default();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut served = 0usize;
+            while let Some(msg) = api_rx.blocking_recv() {
+                assert!(matches!(
+                    msg.request.method,
+                    crate::api::schema::Method::PaneGet(_)
+                ));
+                served += 1;
+                let pane = if served == 1 {
+                    pane_info_with_status(AgentStatus::Working)
+                } else {
+                    pane_info_with_status(AgentStatus::Done)
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&crate::api::schema::SuccessResponse {
+                            id: msg.request.id,
+                            result: crate::api::schema::ResponseResult::PaneInfo { pane },
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            served
+        });
+
+        let mut subscription = ActiveSubscription::new(
+            Subscription::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                agent_status: None,
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_hub.current_sequence(),
+        )
+        .expect("agent status subscription");
+
+        // Idle polls must not resample the pane while the event hub is quiet.
+        for _ in 0..20 {
+            assert!(subscription
+                .poll_batch(&api_tx, &event_hub)
+                .unwrap()
+                .is_empty());
+        }
+
+        // Hub activity lets the next poll resample once and report the
+        // subscriber-visible change that has no matching status event.
+        event_hub.push(workspace_focused_event("trigger"));
+        let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pane.agent_status_changed");
+        assert_eq!(events[0]["data"]["agent_status"], "done");
+
+        for _ in 0..20 {
+            assert!(subscription
+                .poll_batch(&api_tx, &event_hub)
+                .unwrap()
+                .is_empty());
+        }
+
+        // An observed resample that matches the last published value must not
+        // publish again.
+        event_hub.push(workspace_focused_event("noise"));
+        assert!(subscription
+            .poll_batch(&api_tx, &event_hub)
+            .unwrap()
+            .is_empty());
+
+        drop(subscription);
+        drop(api_tx);
+        assert_eq!(
+            responder.join().unwrap(),
+            3,
+            "only the setup probe and post-event resamples may read the pane"
+        );
     }
 }

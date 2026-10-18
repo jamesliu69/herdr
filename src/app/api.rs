@@ -737,6 +737,17 @@ impl App {
         }
     }
 
+    /// Marks the active tab seen and publishes any status changes that the
+    /// flip produced, so subscribers do not need a periodic pane resample.
+    pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
+        let updates = self.state.mark_active_tab_seen();
+        let changed = !updates.is_empty();
+        for update in &updates {
+            self.emit_pane_state_update(update);
+        }
+        changed
+    }
+
     pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,

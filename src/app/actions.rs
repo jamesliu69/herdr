@@ -450,26 +450,58 @@ impl AppState {
         }
     }
 
-    pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
+    /// Marks every pane in the active tab as seen and returns the state updates
+    /// for panes whose subscriber-visible status changed. Callers emit those so
+    /// agent status subscriptions observe a seen flip even when focus did not
+    /// move and no focus event was published.
+    pub(crate) fn mark_active_tab_seen(&mut self) -> Vec<PaneStateUpdate> {
         let Some(ws_idx) = self.active else {
-            return false;
+            return Vec::new();
         };
         let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
             .and_then(crate::workspace::Workspace::active_tab_mut)
         else {
-            return false;
+            return Vec::new();
         };
 
-        let mut changed = false;
-        for pane in tab.panes.values_mut() {
-            if !pane.seen {
-                pane.seen = true;
-                changed = true;
+        let mut updates = Vec::new();
+        for (pane_id, pane) in tab.panes.iter_mut() {
+            if pane.seen {
+                continue;
             }
+            pane.seen = true;
+            let Some(terminal) = self.terminals.get(&pane.attached_terminal_id) else {
+                continue;
+            };
+            // `seen` only feeds the published status for idle panes.
+            if terminal.state != AgentState::Idle {
+                continue;
+            }
+            let presentation = terminal.effective_presentation();
+            let agent_label = terminal.effective_agent_label().map(str::to_string);
+            let known_agent = terminal.effective_known_agent();
+            updates.push(PaneStateUpdate {
+                pane_id: *pane_id,
+                ws_idx,
+                previous_agent_label: agent_label.clone(),
+                previous_known_agent: known_agent,
+                previous_state: terminal.state,
+                previous_seen: false,
+                previous_presentation: presentation.clone(),
+                agent_label,
+                known_agent,
+                state: terminal.state,
+                seen: true,
+                presentation,
+                agent_name_changed: false,
+                agent_released: false,
+                agent_release_status: None,
+                suppress_completion: true,
+            });
         }
-        changed
+        updates
     }
 
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) -> bool {
