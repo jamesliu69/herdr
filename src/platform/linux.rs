@@ -26,6 +26,11 @@ pub(crate) use super::unix_common::{
 #[cfg(test)]
 mod config_file_tests;
 
+mod daemon;
+pub(crate) use daemon::{
+    configure_server_daemon_command, launch_server_daemon, prepare_daemon_process,
+};
+
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 mod power;
