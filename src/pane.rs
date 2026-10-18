@@ -431,11 +431,6 @@ fn absolute_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(unix)]
-fn usable_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
-    absolute_process_cwd(pid).filter(|cwd| cwd.is_dir())
-}
-
-#[cfg(unix)]
 fn foreground_member_cwd_different_from_shell(
     shell_pid: u32,
     shell_cwd: Option<&std::path::PathBuf>,
@@ -2389,7 +2384,7 @@ impl PaneRuntime {
         let windows_powershell_prompt_cwd_reporting =
             uses_windows_powershell_pane_shell(shell_config);
         let mut cmd = pane_shell_command_builder(shell_config)?;
-        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        cmd.cwd(&cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -2431,7 +2426,7 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
-        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        cmd.cwd(&cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -2478,7 +2473,7 @@ impl PaneRuntime {
         for arg in args {
             cmd.arg(arg);
         }
-        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        cmd.cwd(&cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -3847,10 +3842,13 @@ impl PaneRuntime {
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
+            // Do not stat the leader's cwd here: on an unresponsive network
+            // mount that stat blocks the request loop for minutes. The spawn
+            // path validates the directory off-thread.
             let leader_cwd = self
                 .io
                 .foreground_process_group_id()
-                .and_then(usable_process_cwd);
+                .and_then(absolute_process_cwd);
             leader_cwd.or_else(|| self.cwd())
         }
 

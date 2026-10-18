@@ -254,7 +254,9 @@ impl App {
             return false;
         };
 
-        if !cwd.is_dir() {
+        // Probe the directory off-thread so a frozen mount cannot stall the
+        // scheduled resume task indefinitely; a timeout counts as unavailable.
+        if !crate::pty::backend::directory_is_available(&cwd).unwrap_or(false) {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.pending_agent_resume_plan = None;
                 terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());

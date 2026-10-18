@@ -8,6 +8,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 pub(crate) fn spawn_named<F, T>(name: &str, f: F) -> io::Result<JoinHandle<T>>
 where
@@ -43,6 +44,44 @@ where
         Ok(_) => Ok(()),
         // A failed spawn never runs the closure, so the payload is still here.
         Err(err) => take_payload(&slot).map_or(Ok(()), |payload| Err((payload, err))),
+    }
+}
+
+/// Runs `work` on a helper thread and waits up to `timeout` for its result.
+///
+/// Use this for filesystem work that can block for minutes on an unresponsive
+/// network mount. The caller is released after `timeout`; the worker keeps
+/// running and discards its result when the caller is already gone, so a
+/// frozen path can never stall the server's request loop indefinitely.
+pub(crate) fn spawn_blocking_with_timeout<T, F>(
+    name: &str,
+    timeout: Duration,
+    work: F,
+) -> io::Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = spawn_named(name, move || {
+        let result = work();
+        let _ = tx.send(result);
+    })?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = handle.join();
+            Ok(result)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{name} did not complete within {timeout:?}"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            Err(io::Error::other(format!(
+                "{name} worker stopped without producing a result"
+            )))
+        }
     }
 }
 
@@ -90,6 +129,51 @@ pub(crate) mod test_hook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_work_runs_off_the_caller_and_times_out() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let caller = std::thread::current().id();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+
+        let err =
+            spawn_blocking_with_timeout("test-blocking", Duration::from_millis(20), move || {
+                assert_ne!(std::thread::current().id(), caller);
+                worker_started.store(true, std::sync::atomic::Ordering::Release);
+                let _ = release_rx.recv();
+                11_u32
+            })
+            .expect_err("blocking work should time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !started.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            started.load(std::sync::atomic::Ordering::Acquire),
+            "blocking work should have started on the helper thread"
+        );
+        release_tx.send(()).expect("release blocking worker");
+    }
+
+    #[test]
+    fn fast_work_returns_its_result() {
+        let result = spawn_blocking_with_timeout("test-fast", Duration::from_secs(5), || 7_u32)
+            .expect("fast work should complete");
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn injected_spawn_failure_propagates() {
+        test_hook::fail_next_spawns(1);
+        let err = spawn_blocking_with_timeout("test-fail", Duration::from_secs(1), || 1_u32)
+            .expect_err("injected spawn failure should surface");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
 
     #[test]
     fn injected_failure_returns_payload() {

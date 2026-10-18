@@ -9,7 +9,7 @@ pub(crate) struct SpawnedPty {
     pub child: Box<dyn Child + Send + Sync>,
 }
 
-pub(crate) fn spawn_with_portable_pty(
+pub(crate) fn spawn_pty_uncached(
     rows: u16,
     cols: u16,
     cmd: CommandBuilder,
@@ -76,8 +76,8 @@ mod tests {
         let mut cmd = CommandBuilder::new("/bin/cat");
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
 
-        let mut spawned =
-            spawn_with_portable_pty(24, 80, cmd).expect("portable pty setup succeeds");
+        let mut spawned = crate::pty::backend::spawn_with_portable_pty(24, 80, cmd)
+            .expect("portable pty setup succeeds");
         let after_spawn = parent_pty_fd_count();
 
         assert_eq!(
