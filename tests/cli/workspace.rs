@@ -630,6 +630,33 @@ fn config_check_reports_ok_when_config_is_missing() {
     assert!(checked.status.success());
     let stdout = String::from_utf8_lossy(&checked.stdout);
     assert!(stdout.contains("config: ok"), "{stdout}");
+    assert!(stdout.contains("config path:"), "{stdout}");
+    assert!(
+        stdout.contains("no file; using built-in defaults"),
+        "{stdout}"
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn config_check_reports_the_resolved_path_of_an_existing_config() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_path = config_home.join(app_dir_name()).join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, "[keys]\nprefix = \"ctrl+a\"\n").unwrap();
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+
+    assert!(checked.status.success());
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert!(stdout.contains("config: ok"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("config path: {}", config_path.display())),
+        "{stdout}"
+    );
 
     cleanup_test_base(&base);
 }

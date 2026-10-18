@@ -27,70 +27,89 @@ pub fn app_dir_name() -> &'static str {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(dir).join(app_dir_name());
+/// Resolved environment inputs for Herdr's config and state directories.
+///
+/// Values are captured once so path resolution stays testable and so a
+/// defined-but-empty variable (common on Windows) can never turn the config
+/// directory into a path relative to the process working directory. Two Herdr
+/// processes with different working directories would then read different
+/// files while `herdr config check` still reports ok.
+#[derive(Debug, Clone, Default)]
+struct DirEnv {
+    xdg_config_home: Option<PathBuf>,
+    xdg_state_home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    localappdata: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp_dir: PathBuf,
+}
+
+impl DirEnv {
+    fn from_process() -> Self {
+        Self {
+            xdg_config_home: env_path("XDG_CONFIG_HOME"),
+            xdg_state_home: env_path("XDG_STATE_HOME"),
+            appdata: env_path("APPDATA"),
+            localappdata: env_path("LOCALAPPDATA"),
+            userprofile: env_path("USERPROFILE"),
+            home: env_path("HOME"),
+            temp_dir: std::env::temp_dir(),
+        }
     }
-    platform_config_dir()
+}
+
+/// Reads an environment variable as a path, treating an empty value as unset so
+/// it cannot resolve a relative directory. OS-string values are kept as-is, so
+/// a non-Unicode Windows path never silently falls through to a different file.
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn config_dir() -> PathBuf {
+    config_dir_from_env(&DirEnv::from_process(), app_dir_name())
+}
+
+fn config_dir_from_env(env: &DirEnv, app_dir: &str) -> PathBuf {
+    if let Some(dir) = &env.xdg_config_home {
+        return dir.join(app_dir);
+    }
+    if cfg!(windows) {
+        if let Some(dir) = &env.appdata {
+            return dir.join(app_dir);
+        }
+        if let Some(profile) = &env.userprofile {
+            return profile.join("AppData").join("Roaming").join(app_dir);
+        }
+    }
+    if let Some(home) = &env.home {
+        return home.join(format!(".config/{app_dir}"));
+    }
+    env.temp_dir.join(app_dir)
 }
 
 pub fn state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(dir).join(app_dir_name());
-    }
-    platform_state_dir()
+    state_dir_from_env(&DirEnv::from_process(), app_dir_name())
 }
 
-#[cfg(windows)]
-fn platform_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("APPDATA") {
-        return PathBuf::from(dir).join(app_dir_name());
+fn state_dir_from_env(env: &DirEnv, app_dir: &str) -> PathBuf {
+    if let Some(dir) = &env.xdg_state_home {
+        return dir.join(app_dir);
     }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        return PathBuf::from(profile)
-            .join("AppData")
-            .join("Roaming")
-            .join(app_dir_name());
+    if cfg!(windows) {
+        if let Some(dir) = &env.localappdata {
+            return dir.join(app_dir);
+        }
+        if let Some(profile) = &env.userprofile {
+            return profile.join("AppData").join("Local").join(app_dir);
+        }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(format!(".config/{}", app_dir_name()));
+    if let Some(home) = &env.home {
+        return home.join(format!(".local/state/{app_dir}"));
     }
-    std::env::temp_dir().join(app_dir_name())
-}
-
-#[cfg(not(windows))]
-fn platform_config_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
-    } else {
-        std::env::temp_dir().join(app_dir_name())
-    }
-}
-
-#[cfg(windows)]
-fn platform_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(dir).join(app_dir_name());
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        return PathBuf::from(profile)
-            .join("AppData")
-            .join("Local")
-            .join(app_dir_name());
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()));
-    }
-    std::env::temp_dir().join(format!("{}-state", app_dir_name()))
-}
-
-#[cfg(not(windows))]
-fn platform_state_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
-    } else {
-        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
-    }
+    env.temp_dir.join(format!("{app_dir}-state"))
 }
 
 /// Normalize UTF-8 byte-order marks in config text.
@@ -193,10 +212,15 @@ pub(super) fn resolve_config_relative_path(path: &Path) -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
-        return PathBuf::from(path);
-    }
-    config_dir().join("config.toml")
+    config_path_from_env(
+        env_path(CONFIG_PATH_ENV_VAR),
+        &DirEnv::from_process(),
+        app_dir_name(),
+    )
+}
+
+fn config_path_from_env(override_path: Option<PathBuf>, env: &DirEnv, app_dir: &str) -> PathBuf {
+    override_path.unwrap_or_else(|| config_dir_from_env(env, app_dir).join("config.toml"))
 }
 
 pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
@@ -752,6 +776,164 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_dir_prefers_xdg_config_home() {
+        let env = DirEnv {
+            xdg_config_home: Some(PathBuf::from("xdg")),
+            appdata: Some(PathBuf::from("appdata")),
+            home: Some(PathBuf::from("home")),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            config_dir_from_env(&env, "herdr"),
+            PathBuf::from("xdg").join("herdr")
+        );
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_state_home() {
+        let env = DirEnv {
+            xdg_state_home: Some(PathBuf::from("xdg-state")),
+            localappdata: Some(PathBuf::from("local-app-data")),
+            home: Some(PathBuf::from("home")),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            state_dir_from_env(&env, "herdr"),
+            PathBuf::from("xdg-state").join("herdr")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_uses_appdata_on_windows_without_home() {
+        let appdata = PathBuf::from(r"C:\Users\test\AppData\Roaming");
+        let env = DirEnv {
+            appdata: Some(appdata.clone()),
+            ..DirEnv::default()
+        };
+        assert_eq!(config_dir_from_env(&env, "herdr"), appdata.join("herdr"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_falls_back_to_userprofile_without_appdata() {
+        let profile = PathBuf::from(r"C:\Users\test");
+        let env = DirEnv {
+            userprofile: Some(profile.clone()),
+            home: Some(profile),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            config_dir_from_env(&env, "herdr"),
+            PathBuf::from(r"C:\Users\test")
+                .join("AppData")
+                .join("Roaming")
+                .join("herdr")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_falls_back_to_home_without_windows_variables() {
+        let home = PathBuf::from(r"C:\home\test");
+        let env = DirEnv {
+            home: Some(home.clone()),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            config_dir_from_env(&env, "herdr"),
+            home.join(".config").join("herdr")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_falls_back_to_temp_without_any_variable() {
+        let temp = PathBuf::from(r"C:\Temp");
+        let env = DirEnv {
+            temp_dir: temp.clone(),
+            ..DirEnv::default()
+        };
+        assert_eq!(config_dir_from_env(&env, "herdr"), temp.join("herdr"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_appends_the_app_dir_once_with_trailing_separators() {
+        let env = DirEnv {
+            appdata: Some(PathBuf::from(r"C:\Users\test\AppData\Roaming\")),
+            ..DirEnv::default()
+        };
+        let path = config_dir_from_env(&env, "herdr");
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\test\AppData\Roaming").join("herdr")
+        );
+        assert!(path.is_absolute());
+        assert!(!path.ends_with(r"herdr\herdr"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_dir_uses_localappdata_on_windows() {
+        let local = PathBuf::from(r"C:\Users\test\AppData\Local");
+        let env = DirEnv {
+            localappdata: Some(local.clone()),
+            appdata: Some(PathBuf::from(r"C:\Users\test\AppData\Roaming")),
+            ..DirEnv::default()
+        };
+        assert_eq!(state_dir_from_env(&env, "herdr"), local.join("herdr"));
+    }
+
+    #[test]
+    fn env_path_ignores_empty_values() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let name = "HERDR_TEST_EMPTY_ENV_PATH";
+        std::env::set_var(name, "");
+        let value = env_path(name);
+        std::env::remove_var(name);
+        assert_eq!(value, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_path_matches_windows_names_case_insensitively() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let name = "herdr_test_case_insensitive_env_path";
+        std::env::set_var(name, r"C:\Users\test");
+        let value = env_path("HERDR_TEST_CASE_INSENSITIVE_ENV_PATH");
+        std::env::remove_var(name);
+        assert_eq!(value, Some(PathBuf::from(r"C:\Users\test")));
+    }
+
+    #[test]
+    fn config_path_uses_the_resolved_config_dir_without_an_override() {
+        let env = DirEnv {
+            xdg_config_home: Some(PathBuf::from("config-home")),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            config_path_from_env(None, &env, "herdr"),
+            PathBuf::from("config-home")
+                .join("herdr")
+                .join("config.toml")
+        );
+    }
+
+    #[test]
+    fn config_path_keeps_an_explicit_override() {
+        let chosen = PathBuf::from("chosen").join("config.toml");
+        let env = DirEnv {
+            xdg_config_home: Some(PathBuf::from("config-home")),
+            ..DirEnv::default()
+        };
+        assert_eq!(
+            config_path_from_env(Some(chosen.clone()), &env, "herdr"),
+            chosen
+        );
+    }
+
+    #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
         let content = "onboarding = true\n[keys]\nprefix = \"ctrl+b\"\n";
         let updated = upsert_top_level_bool(content, "onboarding", false);
@@ -778,6 +960,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_uses_compact_actionable_banner() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "one".to_string(),
             "two".to_string(),
@@ -794,6 +977,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_unknown_keys_compactly() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "unknown config key ui.mouse_captur; ignoring key".to_string(),
             "unknown config key keys.new_tabb; ignoring key".to_string(),
@@ -807,6 +991,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_keeps_mixed_diagnostics_generic() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "invalid ui config: invalid type: string; keeping current ui settings".to_string(),
             "unknown config key keys.new_tabb; ignoring key".to_string(),
@@ -820,6 +1005,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_default_fallback() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "config parse error: TOML parse error at line 33, column 8\n   |\n33 | type = \"popup\"\n   |        ^^^^^^^\nunknown variant `popup`; using defaults"
                 .to_string(),
@@ -833,6 +1019,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_unreadable_config_impact() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let startup = vec!["config read error: permission denied; using defaults".to_string()];
         assert_eq!(
             config_diagnostic_summary(&startup).as_deref(),
@@ -849,6 +1036,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_retained_live_config() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "config parse error: TOML parse error at line 7, column 4; keeping current config"
                 .to_string(),
