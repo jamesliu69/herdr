@@ -157,6 +157,112 @@ line_regex = ["^exact line$"]
     });
 }
 
+// Title evidence must only break ties: a stale spinner frame in the OSC title
+// cannot hold a pane working over on-screen idle or blocked evidence.
+#[test]
+fn screen_idle_and_blocked_evidence_outrank_stale_title_working() {
+    with_manifest_dirs("title-screen-precedence", || {
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 450
+region = "osc_title"
+visible_working = true
+regex = ['^spinner ']
+
+[[rules]]
+id = "screen_idle"
+state = "idle"
+priority = 460
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+line_regex = ['^\s*[›»]\s+composer-placeholder\s*$']
+
+[[rules]]
+id = "screen_working"
+state = "working"
+priority = 500
+region = "whole_recent"
+visible_working = true
+contains = ["live-timer"]
+
+[[rules]]
+id = "screen_blocked"
+state = "blocked"
+priority = 900
+region = "whole_recent"
+visible_blocker = true
+contains = ["approval-marker"]
+"#,
+        ));
+
+        let idle = explain_with_input(
+            Agent::Codex,
+            DetectionInput {
+                screen: "finished turn\n› composer-placeholder\nstatus",
+                osc_title: "spinner stale",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(idle.state, AgentState::Idle);
+        assert_eq!(
+            idle.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("screen_idle")
+        );
+        assert!(idle.visible_idle);
+
+        let working = explain_with_input(
+            Agent::Codex,
+            DetectionInput {
+                screen: "live-timer\n› composer-placeholder\nstatus",
+                osc_title: "spinner live",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(working.state, AgentState::Working);
+        assert_eq!(
+            working.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("screen_working")
+        );
+        assert!(working.visible_working);
+
+        let blocked = explain_with_input(
+            Agent::Codex,
+            DetectionInput {
+                screen: "approval-marker",
+                osc_title: "spinner stale",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(blocked.state, AgentState::Blocked);
+        assert_eq!(
+            blocked.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("screen_blocked")
+        );
+        assert!(blocked.visible_blocker);
+
+        let title_only = explain_with_input(
+            Agent::Codex,
+            DetectionInput {
+                screen: "unrelated output",
+                osc_title: "spinner live",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(title_only.state, AgentState::Working);
+        assert_eq!(
+            title_only
+                .matched_rule
+                .as_ref()
+                .map(|rule| rule.id.as_str()),
+            Some("title_working")
+        );
+        assert!(title_only.visible_working);
+    });
+}
+
 // A synthetic terminal protocol: live controls may precede a named divider
 // and an optional panel, but a newer prompt/output makes them historical.
 #[test]

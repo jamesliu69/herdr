@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.10.11.1"
+version = "2026.10.18.1"
 min_engine_version = 3
-updated_at = "2026-10-11T00:00:00Z"
+updated_at = "2026-10-18T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -11,13 +11,30 @@ region = "osc_title"
 visible_blocker = true
 contains = ["Action Required"]
 
+# Codex can leave a spinner frame in the title after a turn ends. The title
+# must only break ties: screen working and blocked evidence outrank it so a
+# stale frame cannot hold the pane working over a finished or waiting screen.
 [[rules]]
 id = "osc_title_working"
 state = "working"
-priority = 1050
+priority = 450
 region = "osc_title"
 visible_working = true
 regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+# The empty composer at the bottom is positive on-screen evidence that the
+# turn is over. It must outrank the title above, but stay below screen working
+# (screen_working_fallback) and blocked evidence so live chrome still wins.
+[[rules]]
+id = "screen_idle_composer"
+state = "idle"
+priority = 460
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+any = [
+  { line_regex = ['^[ \t]*[›»][ \t]+Ask Codex'] },
+  { line_regex = ['^[ \t]*[›»][ \t]+Ask a follow-up'] },
+]
 
 [[rules]]
 id = "transcript_viewer"
