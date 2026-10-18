@@ -1,10 +1,10 @@
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead};
 use std::sync::atomic::AtomicBool;
 
 use base64::Engine;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::{
@@ -13,6 +13,7 @@ use crate::protocol::{
 };
 use crate::server::socket_paths::client_socket_path;
 
+use super::transport::ClientMessageSink;
 use super::{do_handshake, init_logging, write_to_server, ClientError, HandshakePixelCapabilities};
 
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
@@ -44,30 +45,111 @@ pub fn run_terminal_session_control(
     let mut write_stream = stream.try_clone()?;
     let _input_thread = std::thread::spawn(move || {
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match terminal_control_command_from_json(&line) {
-                Ok(message) => {
-                    let release = matches!(message, ClientMessage::Detach);
-                    if write_to_server(&mut write_stream, &message).is_err() {
-                        return;
-                    }
-                    if release {
-                        return;
-                    }
-                }
-                Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
-            }
-        }
-        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+        let mut input = stdin.lock();
+        forward_terminal_control_commands(&mut input, &mut write_stream);
     });
 
     write_terminal_session_output(stream)
+}
+
+/// Hard cap for one JSON control command line read from stdin.
+///
+/// The server already caps decoded terminal input at 1 MiB, so no valid command
+/// comes close to this. The cap keeps a malformed stdin stream that never emits
+/// a newline from growing the line buffer without bound.
+const MAX_CONTROL_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlLine {
+    /// A complete line (or the final unterminated line) was read.
+    Read,
+    /// The line exceeded [`MAX_CONTROL_LINE_BYTES`]; only the capped prefix is buffered.
+    TooLong,
+    /// End of input was reached before any byte of a new line was read.
+    Eof,
+}
+
+/// Reads one newline-terminated command from `input` into `buffer`, never
+/// letting `buffer` grow past [`MAX_CONTROL_LINE_BYTES`].
+fn read_bounded_control_line(
+    input: &mut impl BufRead,
+    buffer: &mut Vec<u8>,
+) -> io::Result<ControlLine> {
+    buffer.clear();
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if buffer.is_empty() {
+                ControlLine::Eof
+            } else {
+                ControlLine::Read
+            });
+        }
+        let (has_newline, chunk_len) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (true, index + 1),
+            None => (false, available.len()),
+        };
+        let remaining = MAX_CONTROL_LINE_BYTES.saturating_sub(buffer.len());
+        if chunk_len > remaining {
+            buffer.extend_from_slice(&available[..remaining]);
+            input.consume(remaining);
+            return Ok(ControlLine::TooLong);
+        }
+        buffer.extend_from_slice(&available[..chunk_len]);
+        input.consume(chunk_len);
+        if has_newline {
+            return Ok(ControlLine::Read);
+        }
+    }
+}
+
+/// Forwards JSON command lines from `input` to the server until stdin ends, a
+/// line exceeds the cap, or the server write fails.
+fn forward_terminal_control_commands(
+    input: &mut impl BufRead,
+    write_stream: &mut impl ClientMessageSink,
+) {
+    let mut buffer = Vec::new();
+    loop {
+        match read_bounded_control_line(input, &mut buffer) {
+            Ok(ControlLine::Read) => {}
+            Ok(ControlLine::Eof) => break,
+            Ok(ControlLine::TooLong) => {
+                warn!(
+                    limit = MAX_CONTROL_LINE_BYTES,
+                    "terminal session control input line exceeded the limit; detaching"
+                );
+                break;
+            }
+            Err(err) => {
+                warn!(error = %err, "terminal session control input read failed");
+                break;
+            }
+        }
+        let mut line = buffer.as_slice();
+        line = line.strip_suffix(b"\n").unwrap_or(line);
+        line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Ok(line) = std::str::from_utf8(line) else {
+            warn!("terminal session control input was not valid UTF-8; detaching");
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match terminal_control_command_from_json(line) {
+            Ok(message) => {
+                let release = matches!(message, ClientMessage::Detach);
+                if write_to_server(write_stream, &message).is_err() {
+                    return;
+                }
+                if release {
+                    return;
+                }
+            }
+            Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
+        }
+    }
+    let _ = write_to_server(write_stream, &ClientMessage::Detach);
 }
 
 fn connect_terminal_session_stream(
@@ -125,8 +207,17 @@ fn connect_terminal_session_stream(
     Ok(stream)
 }
 
-fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
+fn write_terminal_session_output(stream: LocalStream) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    forward_terminal_session_output(stream, &mut stdout)
+}
+
+/// Streams server output to `stdout` until the server shuts down or disconnects.
+fn forward_terminal_session_output(
+    mut stream: impl io::Read,
+    stdout: &mut impl io::Write,
+) -> io::Result<()> {
     loop {
         match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
             Ok(ServerMessage::Terminal(frame)) => {
@@ -140,7 +231,7 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                     "full": frame.full,
                     "bytes": encoded,
                 });
-                serde_json::to_writer(&mut stdout, &line)?;
+                serde_json::to_writer(&mut *stdout, &line)?;
                 stdout.write_all(b"\n")?;
                 stdout.flush()?;
             }
@@ -149,7 +240,7 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                     "type": "terminal.closed",
                     "reason": reason,
                 });
-                serde_json::to_writer(&mut stdout, &line)?;
+                serde_json::to_writer(&mut *stdout, &line)?;
                 stdout.write_all(b"\n")?;
                 stdout.flush()?;
                 return Ok(());
@@ -335,5 +426,131 @@ pub(super) fn terminal_control_command_from_json(raw: &str) -> Result<ClientMess
             })
         }
         TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TerminalFrame;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        messages: Vec<ClientMessage>,
+    }
+
+    impl ClientMessageSink for RecordingSink {
+        fn send_client_message(&mut self, message: &ClientMessage) -> io::Result<()> {
+            self.messages.push(message.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_control_line_caps_unterminated_input() {
+        let data = vec![b'x'; MAX_CONTROL_LINE_BYTES * 2 + 1];
+        let mut input = io::Cursor::new(data);
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_bounded_control_line(&mut input, &mut buffer).unwrap(),
+            ControlLine::TooLong
+        );
+        assert_eq!(buffer.len(), MAX_CONTROL_LINE_BYTES);
+        assert_eq!(input.position(), MAX_CONTROL_LINE_BYTES as u64);
+    }
+
+    #[test]
+    fn bounded_control_line_reads_whole_lines_and_trailing_eof() {
+        let mut input = io::Cursor::new(b"one\ntwo".to_vec());
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_bounded_control_line(&mut input, &mut buffer).unwrap(),
+            ControlLine::Read
+        );
+        assert_eq!(buffer, b"one\n");
+        assert_eq!(
+            read_bounded_control_line(&mut input, &mut buffer).unwrap(),
+            ControlLine::Read
+        );
+        assert_eq!(buffer, b"two");
+        assert_eq!(
+            read_bounded_control_line(&mut input, &mut buffer).unwrap(),
+            ControlLine::Eof
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn control_commands_stop_at_the_line_cap_and_detach() {
+        let mut input = io::Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 64]);
+        let mut sink = RecordingSink::default();
+        forward_terminal_control_commands(&mut input, &mut sink);
+        assert_eq!(sink.messages, vec![ClientMessage::Detach]);
+    }
+
+    #[test]
+    fn control_commands_forward_before_eof() {
+        let mut input =
+            io::Cursor::new(b"{\"type\":\"terminal.input\",\"text\":\"hi\"}\n".to_vec());
+        let mut sink = RecordingSink::default();
+        forward_terminal_control_commands(&mut input, &mut sink);
+        assert_eq!(
+            sink.messages,
+            vec![
+                ClientMessage::Input {
+                    data: b"hi".to_vec()
+                },
+                ClientMessage::Detach
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_session_output_returns_on_empty_stream() {
+        let mut input: &[u8] = &[];
+        let mut output = Vec::new();
+        forward_terminal_session_output(&mut input, &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn terminal_session_output_reports_server_shutdown() {
+        let mut frames = Vec::new();
+        protocol::write_message(
+            &mut frames,
+            &ServerMessage::ServerShutdown {
+                reason: Some("server stopped".into()),
+            },
+        )
+        .unwrap();
+        let mut input = frames.as_slice();
+        let mut output = Vec::new();
+        forward_terminal_session_output(&mut input, &mut output).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(line["type"], "terminal.closed");
+        assert_eq!(line["reason"], "server stopped");
+    }
+
+    #[test]
+    fn terminal_session_output_encodes_frames_as_json_lines() {
+        let frame = TerminalFrame {
+            seq: 7,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes: vec![b'A', 0x1b],
+        };
+        let mut frames = Vec::new();
+        protocol::write_message(&mut frames, &ServerMessage::Terminal(frame)).unwrap();
+        let mut input = frames.as_slice();
+        let mut output = Vec::new();
+        forward_terminal_session_output(&mut input, &mut output).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(line["seq"], 7);
+        assert_eq!(line["encoding"], "ansi");
+        assert_eq!(line["width"], 80);
+        assert_eq!(line["height"], 24);
+        assert_eq!(line["full"], true);
+        assert_eq!(line["bytes"], "QRs=");
     }
 }
