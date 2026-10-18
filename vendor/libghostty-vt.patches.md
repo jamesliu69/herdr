@@ -272,3 +272,51 @@ verification:
 (cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='cursorAbsolute keeps the hyperlink when style migration splits the page')
 just maintenance-test
 ```
+
+## 0009 rebuild cursor state when its page is destroyed
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0009-cursor-page-replaced.patch`
+
+herdr issue: https://github.com/herdrdev/herdr/issues/4762
+
+upstream discussion: not opened
+
+upstream pr: https://github.com/ghostty-org/ghostty/pull/14686 (merged as
+`65ff54c67`; the local test places it in the vendored test file)
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/Screen.zig`
+- `vendor/libghostty-vt/src/terminal/Terminal.zig`
+
+reason: `PageList.grow` can free the page the cursor is on while the cursor's
+cached row/cell pointers and its page-local style and hyperlink IDs still refer
+to that page. Line-limit pruning can do this on any screen whose active area is
+one row, and byte-limit recycling plus reflow page replacement can leave the
+same stale cursor state. In release builds the cached pointers survive the
+free because pooled page memory is decommitted rather than unmapped, so the
+server later faults in a read such as `Screen.cursorReload`, which is the
+crash reported in #4762.
+
+The fix moves the cursor re-add logic out of `Screen.increaseCapacity` into a
+shared `cursorPageReplaced`, calls it whenever `grow()` pruned the cursor page,
+and clears the `garbage` flag that pruning sets on the tracked cursor pin so
+the pin now points exactly where the cursor belongs. Upstream fixed the same
+defect in `65ff54c67`; this is a straight port of that change onto the vendored
+base.
+
+remove when: the vendored source rebuilds or preserves the cursor's cached page
+pointers and page-local style/hyperlink references whenever a page is pruned or
+replaced, and the Terminal test below passes without this patch.
+
+verification:
+
+```sh
+(cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='linefeed on single row screen prunes cursor page')
+(cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='Screen: resize')
+just maintenance-test
+```
