@@ -357,9 +357,18 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())
+}
+
+/// Starts the daemon in a systemd user scope when the user manager is
+/// reachable, so the SSH session scope that launched it cannot kill the
+/// server and its panes. Falls back to the detached child configured by
+/// [`detach_server_daemon_command`].
+#[cfg(target_os = "linux")]
+pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
+    linux::launch_server_daemon(command)
 }
 
 /// Starts the daemon through launchd, so quitting the terminal app that
@@ -389,9 +398,17 @@ pub(crate) fn leave_launcher_job() -> Option<String> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {
     Ok(false)
+}
+
+/// Called after exec, before logging, worker threads, or pane creation. On
+/// Linux this leaves the launcher's systemd session scope when the command
+/// was built by [`detach_server_daemon_command`].
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_server_process(handoff_import: bool) -> std::io::Result<bool> {
+    linux::prepare_daemon_process(handoff_import)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -400,6 +417,8 @@ pub fn detach_server_daemon_command(command: &mut std::process::Command) {
 
     #[cfg(target_os = "macos")]
     macos::configure_server_daemon_context(command);
+    #[cfg(target_os = "linux")]
+    linux::configure_server_daemon_command(command);
 
     unsafe {
         command.pre_exec(|| {

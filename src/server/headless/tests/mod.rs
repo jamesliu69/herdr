@@ -4350,6 +4350,59 @@ fn terminal_attach_disconnect_restores_client_shell_pane_size() {
     rt.shutdown_timeout(Duration::from_millis(100));
 }
 
+#[test]
+fn dropped_client_does_not_remove_panes_or_runtimes() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let _runtime_guard = rt.enter();
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("remote");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    server.app.terminal_runtimes.insert(
+        terminal_id.clone(),
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+    );
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(1);
+
+    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 }));
+
+    assert!(server.clients.is_empty());
+    assert_eq!(
+        server.app.state.workspaces.len(),
+        1,
+        "a dropped remote client must not tear down its workspace"
+    );
+    assert!(
+        server.app.state.workspaces[0].pane_state(pane_id).is_some(),
+        "a dropped remote client must not terminate its panes"
+    );
+    assert!(
+        server.app.terminal_runtimes.get(&terminal_id).is_some(),
+        "a dropped remote client must not stop the pane runtime"
+    );
+    assert!(!server.app.state.should_quit);
+
+    shutdown_test_runtimes(&mut server);
+}
+
 #[cfg(unix)]
 #[test]
 fn backpressured_observer_skips_runtime_access_and_recovers_without_new_output() {
